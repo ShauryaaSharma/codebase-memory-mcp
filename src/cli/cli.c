@@ -2121,6 +2121,74 @@ static int cbm_remove_session_hooks(const char *settings_path) {
     return rc;
 }
 
+/* SubagentStart hook: subagents spawned via the Agent tool do NOT fire
+ * SessionStart, so the SessionStart reminder above never reaches them. This
+ * hook is their equivalent. Unlike SessionStart (where plain stdout is injected
+ * as context), SubagentStart injects context only via a JSON object on stdout:
+ *   {"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"…"}}
+ * The text is a leaner variant of the SessionStart protocol: it omits the
+ * "run index_repository first" step, since the parent session has already
+ * indexed the project. Matcher "*" fires for every agent type. */
+#define CMM_SUBAGENT_REMINDER_SCRIPT "cbm-subagent-reminder"
+
+static void cbm_install_subagent_reminder_script(const char *home) {
+    if (!home) {
+        return;
+    }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return;
+    }
+    char hooks_dir[CLI_BUF_1K];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
+
+    char script_path[CLI_BUF_1K];
+    snprintf(script_path, sizeof(script_path), "%s/" CMM_SUBAGENT_REMINDER_SCRIPT, hooks_dir);
+
+    FILE *f = fopen(script_path, "w");
+    if (!f) {
+        return;
+    }
+    /* The additionalContext value is a single line with no embedded quotes,
+     * backslashes, or newlines, so the JSON below is valid as written — no
+     * runtime escaping (and no python3/jq dependency) is required. */
+    (void)fprintf(f,
+                  "#!/bin/bash\n"
+                  "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
+                  "# Installed by codebase-memory-mcp. Fires when any subagent is spawned.\n"
+                  "# SubagentStart injects context via JSON additionalContext, not plain stdout.\n"
+                  "cat << 'REMINDER'\n"
+                  "{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\","
+                  "\"additionalContext\":\"Code discovery: prefer codebase-memory-mcp tools "
+                  "(search_graph, trace_path, get_code_snippet, query_graph, get_architecture, "
+                  "search_code) over grep/file-read for navigating code. Use Grep/Glob/Read for "
+                  "text, configs, and non-code files.\"}}\n"
+                  "REMINDER\n");
+#ifndef _WIN32
+    fchmod(fileno(f), CLI_OCTAL_PERM);
+#endif
+    (void)fclose(f);
+#ifdef _WIN32
+    chmod(script_path, CLI_OCTAL_PERM);
+#endif
+}
+
+int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
+    char command[CLI_BUF_1K];
+    cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, command, sizeof(command));
+    return upsert_hooks_json((hooks_upsert_args_t){.settings_path = settings_path,
+                                                   .hook_event = "SubagentStart",
+                                                   .matcher_str = "*",
+                                                   .command_str = command});
+}
+
+int cbm_remove_claude_subagent_hooks(const char *settings_path) {
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path, .hook_event = "SubagentStart", .matcher_str = "*"});
+}
+
 /* Matcher excludes read_file for consistency with the Claude fix: the hook
  * is an advisory reminder, not a gate over the agent's file reads. */
 #define GEMINI_HOOK_MATCHER "google_search|grep_search"
@@ -3116,6 +3184,8 @@ static void install_claude_code_config(const char *home, const char *binary_path
         plan_record("Claude Code", "hook", p);
         snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT);
         plan_record("Claude Code", "hook", p);
+        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SUBAGENT_REMINDER_SCRIPT);
+        plan_record("Claude Code", "hook", p);
         return;
     }
 
@@ -3149,9 +3219,12 @@ static void install_claude_code_config(const char *home, const char *binary_path
         cbm_install_hook_gate_script(home, binary_path);
         cbm_install_session_reminder_script(home);
         cbm_upsert_session_hooks(settings_path);
+        cbm_install_subagent_reminder_script(home);
+        cbm_upsert_claude_subagent_hooks(settings_path);
     }
     printf("  hooks: PreToolUse (Grep/Glob search-graph augmenter, non-blocking)\n");
     printf("  hooks: SessionStart (MCP usage reminder on startup/resume/clear/compact)\n");
+    printf("  hooks: SubagentStart (MCP usage reminder for subagents)\n");
 
     /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
      * still exists, mention it so users can clean up stale artifacts. */
@@ -3774,8 +3847,9 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
     if (!dry_run) {
         cbm_remove_claude_hooks(settings_path);
         cbm_remove_session_hooks(settings_path);
+        cbm_remove_claude_subagent_hooks(settings_path);
     }
-    printf("  removed PreToolUse + SessionStart hooks\n");
+    printf("  removed PreToolUse + SessionStart + SubagentStart hooks\n");
 }
 
 /* Remove MCP + instructions for a generic agent. */
