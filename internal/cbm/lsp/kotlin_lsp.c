@@ -2245,8 +2245,12 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
     if (cls_qn && ctx->registry) {
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cls_qn);
         if (rt) {
-            kt_emit_resolved(ctx, kt_join_dot(ctx->arena, cls_qn, "<init>"), "lsp_kt_constructor",
-                             KT_CONF_CONSTRUCTOR);
+            /* A constructor call `Foo()` resolves to the Foo CLASS node, which the
+             * textual extractor stored; there is no separate `Foo.<init>` graph
+             * node, and the textual call site's callee is the bare class name
+             * `Foo` (not `<init>`). Emitting cls_qn (not cls_qn.<init>) makes the
+             * pipeline join's callee bare-segment match AND resolves the target. */
+            kt_emit_resolved(ctx, cls_qn, "lsp_kt_constructor", KT_CONF_CONSTRUCTOR);
             return cbm_type_named(ctx->arena, cls_qn);
         }
     }
@@ -2423,7 +2427,16 @@ static const CBMType *kt_eval_navigation_expression_type(KotlinLSPContext *ctx, 
         /* Check object-singleton or companion lookup */
         const CBMRegisteredFunc *rf = kotlin_lookup_method(ctx, recv_qn, member_text);
         if (rf && rf->qualified_name) {
-            kt_emit_resolved(ctx, rf->qualified_name, "lsp_kt_method", KT_CONF_METHOD);
+            /* Distinguish an extension function from a member method: a member's
+             * QN nests under the receiver (`<recv_qn>.<member>`), while an
+             * extension `fun Recv.ext()` is a TOP-LEVEL fun whose QN does NOT
+             * nest under recv_qn (only its receiver_type points back).
+             * kotlin_lookup_method matches both, so pick the strategy by QN shape. */
+            size_t recv_len = strlen(recv_qn);
+            bool is_member = (strncmp(rf->qualified_name, recv_qn, recv_len) == 0 &&
+                              rf->qualified_name[recv_len] == '.');
+            kt_emit_resolved(ctx, rf->qualified_name,
+                             is_member ? "lsp_kt_method" : "lsp_kt_extension", KT_CONF_METHOD);
             if (rf->signature && rf->signature->kind == CBM_TYPE_FUNC &&
                 rf->signature->data.func.return_types && rf->signature->data.func.return_types[0]) {
                 return rf->signature->data.func.return_types[0];
